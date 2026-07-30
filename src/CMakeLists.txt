@@ -21,3 +21,6 @@ add_executable(01_baseline 01_baseline.cpp)
 find_package(Threads REQUIRED)
 add_executable(solution solution.cpp)
 target_link_libraries(solution PRIVATE Threads::Threads)
+
+add_executable(solution2 solution2.cpp)
+target_link_libraries(solution2 PRIVATE Threads::Threads)
