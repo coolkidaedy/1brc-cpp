@@ -24,3 +24,6 @@ target_link_libraries(solution PRIVATE Threads::Threads)
 
 add_executable(solution2 solution2.cpp)
 target_link_libraries(solution2 PRIVATE Threads::Threads)
+
+add_executable(solution3 solution3.cpp)
+target_link_libraries(solution3 PRIVATE Threads::Threads)

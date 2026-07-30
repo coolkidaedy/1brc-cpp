@@ -1,9 +1,10 @@
 #!/bin/bash
-# Runs ./build/solution against the 12 official sample cases.
+# Runs a build/ binary (default: solution) against the 12 official sample cases.
+# Usage: ./run_tests.sh [binary_name]
 set -e
 
 SAMPLES=/Users/aedin/1brc/1brc/src/test/resources/samples
-SOLUTION=$(dirname "$0")/build/solution
+SOLUTION=$(dirname "$0")/build/${1:-solution}
 
 pass=0
 fail=0
