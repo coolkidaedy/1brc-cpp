@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <ranges>
 #include <string>
 #include <unordered_map>
@@ -30,72 +31,95 @@
 #include <thread>
 #include <chrono>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+constexpr int NUM_THREADS = 2;
+
 struct Record {
     uint64_t cnt;
-    double sum;
-    double min;
-    double max;
+    float sum;
+    float min;
+    float max;
 };
 
 using DB = std::unordered_map<std::string, Record>;
 
 // Java rounds half-up toward +inf. Not std::round, not printf: -1.25 -> -1.2, not -1.3.
-static double round1(double v) { return std::floor(v * 10.0 + 0.5) / 10.0; }
+static float round1(float v) { return std::floor(v * 10.0 + 0.5) / 10.0; }
 
 
-DB process_input(std::istream &in) {
-    DB db;
+// Parses [start, end) of the mmap'd buffer (must land on line boundaries)
+// and merges results into the shared db, guarded by db_mutex.
+static void process_range(const char *data, size_t start, size_t end, DB &db, std::mutex &db_mutex) {
+    size_t pos = start;
+    while (pos < end) {
+        size_t semi = pos;
+        while (data[semi] != ';') ++semi;
+        std::string station(data + pos, semi - pos);
 
-    std::string station;
-    std::string value;
+        size_t nl = semi + 1;
+        while (data[nl] != '\n') ++nl;
+        std::string value(data + semi + 1, nl - semi - 1);
 
-    std::chrono::duration<double> getline_time{0};
-    std::chrono::duration<double> stod_time{0};
-    std::chrono::duration<double> find_time{0};
-    std::chrono::duration<double> insert_time{0};
-    std::chrono::duration<double> update_time{0};
+        float fp_value = std::stof(value);
+        pos = nl + 1;
 
-    auto tp = std::chrono::steady_clock::now();
-
-    // Grab the station and the measured value from the input
-    while (std::getline(in, station, ';') && std::getline(in, value, '\n')) {
-        auto t1 = std::chrono::steady_clock::now();
-        getline_time += t1 - tp;
-
-        // Convert the measured value into a floating point
-        double fp_value = std::stod(value);
-        auto t2 = std::chrono::steady_clock::now();
-        stod_time += t2 - t1;
-
-        // Lookup the station in our database
+        std::lock_guard<std::mutex> lock(db_mutex);
         auto it = db.find(station);
-        auto t3 = std::chrono::steady_clock::now();
-        find_time += t3 - t2;
-
         if (it == db.end()) {
-            // If it's not there, insert
             db.emplace(station, Record{1, fp_value, fp_value, fp_value});
-            auto t4 = std::chrono::steady_clock::now();
-            insert_time += t4 - t3;
-            tp = t4;
             continue;
         }
-        // Otherwise update the information
-        it->second.min = std::min(it->second.min, fp_value);
-        it->second.max = std::max(it->second.max, fp_value);
+        it->second.min = std::min(it->second.min, static_cast<double>(fp_value));
+        it->second.max = std::max(it->second.max, static_cast<double>(fp_value));
         it->second.sum += fp_value;
         ++it->second.cnt;
-        auto t4 = std::chrono::steady_clock::now();
-        update_time += t4 - t3;
-        tp = t4;
     }
-    //std::this_thread::sleep_for(std::chrono::seconds(10));
+}
 
-    std::cerr << "  getline: " << getline_time.count() << "s\n";
-    std::cerr << "  stod:    " << stod_time.count() << "s\n";
-    std::cerr << "  find:    " << find_time.count() << "s\n";
-    std::cerr << "  insert:  " << insert_time.count() << "s\n";
-    std::cerr << "  update:  " << update_time.count() << "s\n";
+DB process_input(const std::string &path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        std::cerr << "Failed to open " << path << "\n";
+        std::exit(1);
+    }
+
+    struct stat st{};
+    fstat(fd, &st);
+    size_t size = static_cast<size_t>(st.st_size);
+
+    char *data = static_cast<char *>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+    close(fd);
+    if (data == MAP_FAILED) {
+        std::cerr << "Failed to mmap " << path << "\n";
+        std::exit(1);
+    }
+
+    // Snap NUM_THREADS-1 split points to the next line boundary so no
+    // thread's range straddles a partial record.
+    std::vector<size_t> boundaries(NUM_THREADS + 1);
+    boundaries[0] = 0;
+    boundaries[NUM_THREADS] = size;
+    for (int i = 1; i < NUM_THREADS; ++i) {
+        size_t p = size * i / NUM_THREADS;
+        while (p < size && data[p] != '\n') ++p;
+        if (p < size) ++p;
+        boundaries[i] = p;
+    }
+
+    DB db;
+    std::mutex db_mutex;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        threads.emplace_back(process_range, data, boundaries[i], boundaries[i + 1],
+                              std::ref(db), std::ref(db_mutex));
+    }
+    for (auto &t : threads) t.join();
+
+    munmap(data, size);
 
     return db;
 }
@@ -125,20 +149,6 @@ void format_output(std::ostream &out, const DB &db) {
 int main(int argc, char **argv) {
     const std::string path = (argc > 1) ? argv[1] : "measurements.txt";
 
-    std::ifstream in(path);
-    if (!in.is_open()) {
-        std::cerr << "Failed to open " << path << "\n";
-        return 1;
-    }
-
-    auto t0 = std::chrono::steady_clock::now();
-    auto db = process_input(in);
-    auto t1 = std::chrono::steady_clock::now();
+    auto db = process_input(path);
     format_output(std::cout, db);
-    auto t2 = std::chrono::steady_clock::now();
-
-    std::chrono::duration<double> process_input_time = t1 - t0;
-    std::chrono::duration<double> format_output_time = t2 - t1;
-    std::cerr << "process_input: " << process_input_time.count() << "s\n";
-    std::cerr << "format_output: " << format_output_time.count() << "s\n";
 }
