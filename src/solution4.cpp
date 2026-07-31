@@ -21,10 +21,10 @@
 #include <atomic>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <ranges>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <thread>
@@ -38,7 +38,7 @@ constexpr int NUM_THREADS = 8;
 // Deliberately >> NUM_THREADS so a thread stuck on a slow core just claims
 // fewer chunks over the same wall-clock time, instead of blocking everyone
 // else at join() like a fixed even split would.
-constexpr int NUM_CHUNKS = 256;
+constexpr int NUM_CHUNKS = 200;
 
 struct Record {
     uint64_t cnt;
@@ -47,7 +47,93 @@ struct Record {
     int64_t max;
 };
 
-using DB = std::unordered_map<std::string, Record>;
+// Open-addressing hash table (linear probing) over one contiguous
+// std::vector<Slot>, instead of std::unordered_map's separately
+// heap-allocated bucket nodes. Fixed, non-resizing capacity — safe because
+// the official 1BRC spec guarantees at most 10,000 unique station names, so
+// even worst case this stays well under 20% load factor.
+class FlatMap {
+public:
+    FlatMap() : slots_(CAPACITY) {}
+
+    // Inserts a new station (first occurrence) or folds value into its
+    // existing running stats.
+    void update(const std::string &key, int64_t value) {
+        size_t idx = index_of(key);
+        while (!slots_[idx].key.empty()) {
+            if (slots_[idx].key == key) {
+                Record &r = slots_[idx].record;
+                r.min = std::min(r.min, value);
+                r.max = std::max(r.max, value);
+                r.sum += value;
+                ++r.cnt;
+                return;
+            }
+            idx = (idx + 1) & MASK;
+        }
+        slots_[idx].key = key;
+        slots_[idx].record = Record{1, value, value, value};
+    }
+
+    // Folds every entry of `other` into this table, combining records for
+    // any station present in both.
+    void merge(const FlatMap &other) {
+        for (const auto &slot : other.slots_) {
+            if (slot.key.empty()) continue;
+            merge_one(slot.key, slot.record);
+        }
+    }
+
+    const Record *find(const std::string &key) const {
+        size_t idx = index_of(key);
+        while (!slots_[idx].key.empty()) {
+            if (slots_[idx].key == key) return &slots_[idx].record;
+            idx = (idx + 1) & MASK;
+        }
+        return nullptr;
+    }
+
+    template <typename F>
+    void for_each(F f) const {
+        for (const auto &slot : slots_) {
+            if (!slot.key.empty()) f(slot.key, slot.record);
+        }
+    }
+
+private:
+    static constexpr size_t CAPACITY = 1 << 16; // must be a power of two
+    static constexpr size_t MASK = CAPACITY - 1;
+
+    struct Slot {
+        std::string key; // empty key == empty slot; station names are never empty
+        Record record;
+    };
+
+    static size_t index_of(const std::string &key) {
+        return std::hash<std::string>{}(key) & MASK;
+    }
+
+    void merge_one(const std::string &key, const Record &rec) {
+        size_t idx = index_of(key);
+        while (!slots_[idx].key.empty()) {
+            if (slots_[idx].key == key) {
+                Record &r = slots_[idx].record;
+                r.cnt += rec.cnt;
+                r.sum += rec.sum;
+                r.min = std::min(r.min, rec.min);
+                r.max = std::max(r.max, rec.max);
+                return;
+            }
+            idx = (idx + 1) & MASK;
+        }
+        slots_[idx].key = key;
+        slots_[idx].record = rec;
+    }
+
+    std::vector<Slot> slots_;
+};
+
+using DB = FlatMap;
 
 // Every value has exactly one decimal digit, e.g. "-12.3" or "5.0", so it can
 // be represented exactly as an integer count of tenths ("-12.3" -> -123).
@@ -84,32 +170,7 @@ static void process_range(const char *data, size_t start, size_t end, DB &db) {
         int64_t fp_value = parse_tenths(data, semi + 1);
         pos = nl + 1;
 
-        auto it = db.find(station);
-        if (it == db.end()) {
-            db.emplace(station, Record{1, fp_value, fp_value, fp_value});
-        } else {
-            it->second.min = std::min(it->second.min, fp_value);
-            it->second.max = std::max(it->second.max, fp_value);
-            it->second.sum += fp_value;
-            ++it->second.cnt;
-        }
-    }
-}
-
-// Reduce phase: folds `from` into `into`, combining records for any station
-// that landed in both (with NUM_CHUNKS >> NUM_THREADS, a busy station is
-// very likely to appear across several chunks/threads).
-static void reduce_into(DB &into, DB &&from) {
-    for (auto &[station, rec] : from) {
-        auto it = into.find(station);
-        if (it == into.end()) {
-            into.emplace(station, rec);
-        } else {
-            it->second.cnt += rec.cnt;
-            it->second.sum += rec.sum;
-            it->second.min = std::min(it->second.min, rec.min);
-            it->second.max = std::max(it->second.max, rec.max);
-        }
+        db.update(station, fp_value);
     }
 }
 
@@ -167,7 +228,7 @@ DB process_input(const std::string &path) {
     // Reduce phase: fold all per-thread maps into one.
     DB db = std::move(thread_dbs[0]);
     for (int i = 1; i < NUM_THREADS; ++i) {
-        reduce_into(db, std::move(thread_dbs[i]));
+        db.merge(thread_dbs[i]);
     }
 
     return db;
@@ -194,15 +255,15 @@ static void write_tenths(std::ostream &out, int64_t tenths) {
 }
 
 void format_output(std::ostream &out, const DB &db) {
-    std::vector<std::string> names(db.size());
+    std::vector<std::string> names;
+    db.for_each([&](const std::string &k, const Record &) { names.push_back(k); });
     // Sorting UTF-8 lexicographically by byte == sorting by codepoint.
-    std::ranges::copy(db | std::views::keys, names.begin());
     std::ranges::sort(names);
 
     std::string delim = "";
     out << "{";
     for (const auto &k : names) {
-        const auto &record = db.find(k)->second;
+        const Record &record = *db.find(k);
         int64_t cnt = static_cast<int64_t>(record.cnt);
 
         // record.sum is already an exact tenths count, so rounding it first
