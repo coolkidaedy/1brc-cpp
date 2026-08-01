@@ -20,11 +20,13 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <thread>
@@ -57,11 +59,12 @@ public:
     FlatMap() : slots_(CAPACITY) {}
 
     // Inserts a new station (first occurrence) or folds value into its
-    // existing running stats.
-    void update(const std::string &key, int64_t value) {
+    // existing running stats. key points straight into the mmap'd file —
+    // no allocation, no copy, just a pointer/length pair getting stored.
+    void update(std::string_view key, int64_t value) {
         size_t idx = index_of(key);
-        while (!slots_[idx].key.empty()) {
-            if (slots_[idx].key == key) {
+        while (slots_[idx].key.len != 0) {
+            if (key_matches(slots_[idx].key, key)) {
                 Record &r = slots_[idx].record;
                 r.min = std::min(r.min, value);
                 r.max = std::max(r.max, value);
@@ -71,7 +74,7 @@ public:
             }
             idx = (idx + 1) & MASK;
         }
-        slots_[idx].key = key;
+        slots_[idx].key = Key{key.data(), static_cast<uint32_t>(key.size())};
         slots_[idx].record = Record{1, value, value, value};
     }
 
@@ -79,15 +82,15 @@ public:
     // any station present in both.
     void merge(const FlatMap &other) {
         for (const auto &slot : other.slots_) {
-            if (slot.key.empty()) continue;
+            if (slot.key.len == 0) continue;
             merge_one(slot.key, slot.record);
         }
     }
 
-    const Record *find(const std::string &key) const {
+    const Record *find(std::string_view key) const {
         size_t idx = index_of(key);
-        while (!slots_[idx].key.empty()) {
-            if (slots_[idx].key == key) return &slots_[idx].record;
+        while (slots_[idx].key.len != 0) {
+            if (key_matches(slots_[idx].key, key)) return &slots_[idx].record;
             idx = (idx + 1) & MASK;
         }
         return nullptr;
@@ -96,7 +99,7 @@ public:
     template <typename F>
     void for_each(F f) const {
         for (const auto &slot : slots_) {
-            if (!slot.key.empty()) f(slot.key, slot.record);
+            if (slot.key.len != 0) f(std::string_view(slot.key.ptr, slot.key.len), slot.record);
         }
     }
 
@@ -104,19 +107,33 @@ private:
     static constexpr size_t CAPACITY = 1 << 16; // must be a power of two
     static constexpr size_t MASK = CAPACITY - 1;
 
+    // Compact key pointing straight into the mmap'd file: 12 bytes instead
+    // of std::string_view's 16 (size_t len -> uint32_t), keeping Slot
+    // smaller and denser in the cache. len == 0 means an empty slot —
+    // station names are never empty.
+    struct Key {
+        const char *ptr;
+        uint32_t len;
+    };
+
     struct Slot {
-        std::string key; // empty key == empty slot; station names are never empty
+        Key key;
         Record record;
     };
 
-    static size_t index_of(const std::string &key) {
-        return std::hash<std::string>{}(key) & MASK;
+    static size_t index_of(std::string_view key) {
+        return std::hash<std::string_view>{}(key) & MASK;
     }
 
-    void merge_one(const std::string &key, const Record &rec) {
-        size_t idx = index_of(key);
-        while (!slots_[idx].key.empty()) {
-            if (slots_[idx].key == key) {
+    static bool key_matches(const Key &stored, std::string_view key) {
+        return stored.len == key.size() && memcmp(stored.ptr, key.data(), stored.len) == 0;
+    }
+
+    void merge_one(const Key &key, const Record &rec) {
+        std::string_view sv(key.ptr, key.len);
+        size_t idx = index_of(sv);
+        while (slots_[idx].key.len != 0) {
+            if (key_matches(slots_[idx].key, sv)) {
                 Record &r = slots_[idx].record;
                 r.cnt += rec.cnt;
                 r.sum += rec.sum;
@@ -162,15 +179,15 @@ static void process_range(const char *data, size_t start, size_t end, DB &db) {
     while (pos < end) {
         size_t semi = pos;
         while (data[semi] != ';') ++semi;
-        std::string station(data + pos, semi - pos);
 
         size_t nl = semi + 1;
         while (data[nl] != '\n') ++nl;
 
         int64_t fp_value = parse_tenths(data, semi + 1);
-        pos = nl + 1;
 
-        db.update(station, fp_value);
+        db.update(std::string_view(data + pos, semi - pos), fp_value);
+
+        pos = nl + 1;
     }
 }
 
@@ -223,7 +240,11 @@ DB process_input(const std::string &path) {
     }
     for (auto &t : threads) t.join();
 
-    munmap(data, size);
+    // Deliberately not calling munmap: db's keys are string_views pointing
+    // straight into `data`, and they stay alive through format_output in
+    // main() after this function returns. Unmapping here would leave every
+    // key dangling. This is a one-shot CLI process that exits right after
+    // printing, so the OS reclaims the mapping on exit anyway.
 
     // Reduce phase: fold all per-thread maps into one.
     DB db = std::move(thread_dbs[0]);
@@ -255,8 +276,8 @@ static void write_tenths(std::ostream &out, int64_t tenths) {
 }
 
 void format_output(std::ostream &out, const DB &db) {
-    std::vector<std::string> names;
-    db.for_each([&](const std::string &k, const Record &) { names.push_back(k); });
+    std::vector<std::string_view> names;
+    db.for_each([&](std::string_view k, const Record &) { names.push_back(k); });
     // Sorting UTF-8 lexicographically by byte == sorting by codepoint.
     std::ranges::sort(names);
 
