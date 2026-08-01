@@ -36,7 +36,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-constexpr int NUM_THREADS = 8;
+constexpr int NUM_THREADS = 14;
 // Deliberately >> NUM_THREADS so a thread stuck on a slow core just claims
 // fewer chunks over the same wall-clock time, instead of blocking everyone
 // else at join() like a fixed even split would.
