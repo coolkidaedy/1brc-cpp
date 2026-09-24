@@ -1,16 +1,23 @@
 #!/bin/bash
-# Runs a build/ binary (default: solution) against the 12 official sample cases.
+# Runs a build/ binary against the official sample cases.
 # Usage: ./run_tests.sh [binary_name]
-set -e
+set -euo pipefail
 
-SAMPLES=/Users/aedin/1brc/1brc/src/test/resources/samples
-SOLUTION=$(dirname "$0")/build/${1:-solution}
+ROOT=$(cd "$(dirname "$0")" && pwd)
+SAMPLES=${SAMPLES:-"$ROOT/1brc/src/test/resources/samples"}
+SOLUTION=${1:-solution5}
+[[ "$SOLUTION" == */* ]] || SOLUTION="$ROOT/build/$SOLUTION"
+shopt -s nullglob
+inputs=("$SAMPLES"/*.txt)
+(( ${#inputs[@]} )) || { echo "No samples found: $SAMPLES" >&2; exit 1; }
+actual=$(mktemp)
+trap 'rm -f "$actual"' EXIT
 
 pass=0
 fail=0
-for input in "$SAMPLES"/*.txt; do
+for input in "${inputs[@]}"; do
     expected="${input%.txt}.out"
-    if diff <("$SOLUTION" "$input") "$expected" >/dev/null 2>&1; then
+    if "$SOLUTION" "$input" >"$actual" && diff -u "$expected" "$actual"; then
         pass=$((pass + 1))
     else
         fail=$((fail + 1))
@@ -19,3 +26,4 @@ for input in "$SAMPLES"/*.txt; do
 done
 
 echo "$pass passed, $fail failed"
+(( fail == 0 ))

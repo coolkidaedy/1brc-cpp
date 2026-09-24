@@ -30,3 +30,10 @@ target_link_libraries(solution3 PRIVATE Threads::Threads)
 
 add_executable(solution4 solution4.cpp)
 target_link_libraries(solution4 PRIVATE Threads::Threads)
+
+add_executable(solution5 solution5.cpp)
+target_link_libraries(solution5 PRIVATE Threads::Threads)
+option(SOLUTION5_NOFORK "Include worker teardown in solution5 process lifetime" OFF)
+if(SOLUTION5_NOFORK)
+    target_compile_definitions(solution5 PRIVATE NOFORK)
+endif()
